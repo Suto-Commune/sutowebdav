@@ -63,7 +63,12 @@ class NetworkException(Exception):
 
 
 class DavClient:
-    def __init__(self, url: str, username: str | None = None, password: str | None = None, *, proxy=None, cwd='/',
+    def __init__(self,
+                 url: str,
+                 username: str | None = None,
+                 password: str | None = None,
+                 *,
+                 proxy=None,
                  **kwargs):
         self.url = url
         self.username = username
@@ -78,9 +83,7 @@ class DavClient:
             base_url=self.url,
             proxies=proxy,
             **kwargs)
-        self.cwd = cwd
-        if not self.cwd.endswith('/'):
-            self.cwd = self.cwd + '/'
+        self.cwd = "/"
 
     def __enter__(self):
         return self
@@ -206,12 +209,15 @@ class DavClient:
 
     async def cd(self, path: str):
         if not path.startswith('/'):
-            self.cwd = self.cwd + path
+            rt_cwd = self.cwd + path
         else:
             if path.endswith('/'):
-                self.cwd = path
+                rt_cwd = path
             else:
-                self.cwd = path + '/'
+                rt_cwd = path + '/'
+        if not (await self.is_exists(path)):
+            raise FileNotFoundError(path)
+        self.cwd = rt_cwd
 
     async def close(self):
         await self.http_client.aclose()
