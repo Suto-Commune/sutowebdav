@@ -23,10 +23,14 @@
 
 @Date       : 2024/8/31 下午7:57
 """
+import contextlib
+import io
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import md5
 from os import PathLike
-from typing import AsyncGenerator, Any
+from typing import AsyncGenerator, Any, Iterable, AsyncIterable, Literal
 from xml.etree import cElementTree
 
 import httpx
@@ -47,8 +51,20 @@ def _parse_prop(elem, name, default=None):
     return default if child is None else child.text
 
 
+class NetworkException(Exception):
+    def __init__(self, method, path, code, message):
+        self.code = code
+        self.message = message
+        self.method = method
+        self.path = path
+
+    def __str__(self):
+        return f"Request failed: {self.method} {self.path} {self.code} {self.message}"
+
+
 class DavClient:
-    def __init__(self, url: str, username: str | None = None, password: str | None = None, *, proxy=None, cwd='/'):
+    def __init__(self, url: str, username: str | None = None, password: str | None = None, *, proxy=None, cwd='/',
+                 **kwargs):
         self.url = url
         self.username = username
         self.password = password
@@ -60,7 +76,8 @@ class DavClient:
         self.http_client = httpx.AsyncClient(
             auth=auth,
             base_url=self.url,
-            proxies=proxy)
+            proxies=proxy,
+            **kwargs)
         self.cwd = cwd
         if not self.cwd.endswith('/'):
             self.cwd = self.cwd + '/'
@@ -79,7 +96,7 @@ class DavClient:
 
         resp = await self.http_client.request(method, _path, **kwargs)
         if resp.status_code not in expected_status_codes:
-            raise Exception(f"Request failed: {method} {path} {resp.status_code} {resp.content}")
+            raise NetworkException(method, _path, resp.status_code, resp.text)
         return resp
 
     async def mkdir(self, path: str):
@@ -88,13 +105,16 @@ class DavClient:
     async def rmdir(self, path: str):
         await self.request('DELETE', path, (204,))
 
-    async def upload(self,data: str | PathLike | bytes, path: str):
+    async def upload(self, data: str | PathLike | bytes | Iterable[bytes] | AsyncIterable[bytes], path: str):
         if isinstance(data, bytes):
             data = data
+        elif isinstance(data, Iterable | AsyncIterable):
+            pass
         else:
             with open(data, 'rb') as f:
                 data = f.read()
-        await self.request('PUT', path, (201, 204), data=data)
+
+        await self.request('PUT', path, (201, 204), content=data)
 
     async def delete(self, path: str):
         await self.request('DELETE', path, (204,))
@@ -104,12 +124,12 @@ class DavClient:
         return resp.status_code == 200
 
     async def download(self, path: str, local_path: str):
-        resp = await self.request('GET', path, (200,), stream=True)
+        resp = await self.request('GET', path, (200,))
         with open(local_path, 'wb') as f:
             f.write(resp.content)
 
     async def download_stream(self, path: str) -> SyncByteStream | AsyncByteStream | None:
-        resp = await self.request('GET', path, (200,), stream=True)
+        resp = await self.request('GET', path, (200,))
         return resp.stream
 
     async def ls(self, path: str) -> AsyncGenerator[DavFile, Any]:
@@ -132,6 +152,57 @@ class DavClient:
                     yield f
             else:
                 yield file
+
+    @contextlib.asynccontextmanager
+    async def open(self,
+                   path: str,
+                   mode: Literal['w', 'a', 'wb', 'ab'] = 'ab',
+                   *,
+                   decoding='utf-8') -> AsyncGenerator[io.IOBase, None]:
+        assert mode in ('w', 'a', 'wb', 'ab')
+        hasher = md5()
+        if mode.endswith('b'):
+            tmp_f_mode = "w+b"
+        else:
+            tmp_f_mode = "w+"
+        with tempfile.TemporaryFile(tmp_f_mode) as f:
+
+            try:
+                resp = await self.request('GET', path, (200,))
+                async for chunk in resp.aiter_bytes():
+                    hasher.update(chunk)
+                    f.write(chunk if tmp_f_mode == "w+b" else chunk.decode(decoding))
+
+            except NetworkException as e:
+                if e.code == 404:
+                    pass
+                else:
+                    raise e
+            initial_hash = hasher.hexdigest()
+
+            if mode.startswith('w'):
+                f.seek(0)
+
+            yield f
+            f.seek(0)
+            f.seek(0)
+            hasher = md5()
+            for chunk in f:
+                hasher.update(chunk)
+            final_hash = hasher.hexdigest()
+
+            f.seek(0)
+
+            async def reader(_f):
+                nonlocal chunk
+                for chunk in _f:
+                    print(chunk)
+                    yield chunk
+
+            print(initial_hash, final_hash)
+
+            if initial_hash != final_hash:
+                await self.upload(reader(f), path)
 
     async def cd(self, path: str):
         if not path.startswith('/'):
